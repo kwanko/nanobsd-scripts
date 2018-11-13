@@ -1,0 +1,740 @@
+#!/usr/local/bin/bash
+
+set -o pipefail
+umask 0027
+
+CFG_SLICE=/cfg
+GIT_SLICE=/cfg-git
+PERMISSION_LIST=permissions.list
+ENCRYPTED_FILELIST=encrypted_files.list
+PASS_FILE=encrypted_files.key
+
+lock=/tmp/commit_cfg.lock
+
+if [ -e "${lock}" ] && kill -0 "$(cat ${lock})" &>/dev/null ; then
+    echo 'already running. aborting...'
+    exit 1
+fi
+
+echo "$$" > "${lock}"
+
+function usage() {
+    echo "$0 [init|add-remote|del-remote|list-remotes|mark|unmark|list-marks|push|pull]"
+    echo ""
+    usage_init
+    usage_add_remote
+    usage_del_remote
+    usage_list_remotes
+    usage_mark
+    usage_unmark
+    usage_list_marks
+    usage_push
+    usage_pull
+}
+
+function usage_init() {
+    echo "  $0 init -k <encryption_key_file> -u <git_username> -m <git_mail_address>: initialize the git repo in ${GIT_SLICE} with <git_username> and <git_mail_address>, and setup encryption key"
+}
+
+function usage_add_remote() {
+    echo "  $0 add-remote -n <remote_name> -u <remote_url>: add new remote git"
+}
+
+function usage_del_remote() {
+    echo "  $0 del-remote -n <remote_name>: remove a remote git"
+}
+
+function usage_list_remotes() {
+    echo "  $0 list-remotes: list remote gits"
+}
+
+function usage_mark() {
+    echo "  $0 mark <file>: mark the file as to be encrypted"
+}
+
+function usage_unmark() {
+    echo "  $0 unmark <file>: unmark the file as to be encrypted"
+}
+
+function usage_list_marks() {
+    echo "  $0 list-marks: list files to be encrypted"
+}
+
+function usage_push() {
+    echo "  $0 push [-f]: push config to remote gits (-f for no interactive validation)"
+}
+
+function usage_pull() {
+    echo "  $0 pull [-f] [-e]: pull config from git and update current config in /cfg (-f for no interative validation / -e for error if no modification applied)"
+}
+
+function setup_dir() {
+    # create directory structure
+    mkdir -p "${GIT_SLICE}/git"
+    mkdir -p "${GIT_SLICE}/hashes"
+    # initialize an empty list of encrypted files if needed
+    if [ ! -f "${GIT_SLICE}/${ENCRYPTED_FILELIST}" ] ; then
+        touch "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    fi
+    # initialize an empty permission file
+    if [ ! -f "${GIT_SLICE}/${PERMISSION_LIST}" ] ; then
+        touch "${GIT_SLICE}/${PERMISSION_LIST}"
+    fi
+}
+
+function init() {
+    # argument parsing
+    args=$(getopt k:m:u: $@)
+    if [ $? -ne 0 ] ; then
+        usage_init
+        exit 2
+    fi
+    set -- $args
+    for i ; do
+        case "$i" in
+            -k)
+                key_path="${2}"
+                shift
+                shift
+                ;;
+            -m)
+                user_mail="${2}"
+                shift
+                shift
+                ;;
+            -u)
+                user_name="${2}"
+                shift
+                shift
+                ;;
+            --)
+                shift
+                break
+        esac
+    done
+    if [ $# -gt 0 ] ; then
+        echo "extraneous arguments supplied: <$@>"
+        usage_init
+        exit 2
+    fi
+    if [ -z "${key_path}" ] ; then
+        echo "missing required key file"
+        usage_init
+        exit 2
+    fi
+    if [ -z "${user_name}" ] ; then
+        echo "missing required username"
+        usage_init
+        exit 2
+    fi
+    if [ -z "${user_mail}" ] ; then
+        echo "missing required user email"
+        usage_init
+        exit 2
+    fi
+    # validate key file readability
+    if [ ! -r "${key_path}" ] ; then
+        echo "can't read <${key_path}>"
+        exit 1
+    fi
+    set -e
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    setup_dir
+    # update encryption key
+    cp "${key_path}" "${GIT_SLICE}/${PASS_FILE}"
+    # initialize and configure git
+    cd "${GIT_SLICE}/git"
+    git init .
+    git config user.email "${user_mail}"
+    git config user.name "${user_mail}"
+    git config http.sslCAPath /etc/ssl/certs
+    git config core.filemode true
+    mkdir -p "${GIT_SLICE}/git/cfg"
+    chmod 0755 "${GIT_SLICE}/git/cfg"
+    mkdir -p "${GIT_SLICE}/git/hashes"
+    cd "${local_dir}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function add-remote() {
+    # argument parsing
+    args=$(getopt n:u: $@)
+    if [ $? -ne 0 ] ; then
+        usage_add_remote
+        exit 2
+    fi
+    set -- $args
+    for i ; do
+        case "$i" in
+            -n)
+                remote_name="${2}"
+                shift
+                shift
+                ;;
+            -u)
+                remote_url="${2}"
+                shift
+                shift
+                ;;
+            --)
+                shift
+                break
+        esac
+    done
+    if [ $# -gt 0 ] ; then
+        echo "extraneous arguments supplied: <$@>"
+        usage_add_remote
+        exit 2
+    fi
+    if [ -z "${remote_name}" ] ; then
+        echo "missing required remote name"
+        usage_add_remote
+        exit 2
+    fi
+    if [ -z "${remote_url}" ] ; then
+        echo "missing required remote url"
+        usage_add_remote
+        exit 2
+    fi
+    # add git remote
+    echo "adding remote <${remote_name}>: <${remote_url}>"
+    set -e
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    cd "${GIT_SLICE}/git"
+    git remote -v add "${remote_name}" "${remote_url}"
+    cd "${local_dir}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function del-remote() {
+    # argument parsing
+    args=$(getopt n:u: $@)
+    if [ $? -ne 0 ] ; then
+        usage_del_remote
+        exit 2
+    fi
+    set -- $args
+    for i ; do
+        case "$i" in
+            -n)
+                remote_name="${2}"
+                shift
+                shift
+                ;;
+            --)
+                shift
+                break
+        esac
+    done
+    if [ $# -gt 0 ] ; then
+        echo "extraneous arguments supplied: <$@>"
+        usage_del_remote
+        exit 2
+    fi
+    if [ -z "${remote_name}" ] ; then
+        echo "missing required remote name"
+        usage_del_remote
+        exit 2
+    fi
+    # remove git remote
+    echo "removing remote <${remote_name}>"
+    set -e
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    cd "${GIT_SLICE}/git"
+    git remote -v remove "${remote_name}"
+    cd "${local_dir}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function list-remotes() {
+    # argument parsing
+    if [ $# -gt 0 ] ; then
+        echo "extraneous arguments supplied: <$@>"
+        usage_list_remotes
+        exit 2
+    fi
+    # list git remotes
+    set -e
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    cd "${GIT_SLICE}/git"
+    git remote -v
+    cd "${local_dir}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function mark() {
+    # argument parsing
+    if [ $# -lt 1 ] ; then
+        echo "missing filename"
+        usage_mark
+        exit 2
+    fi
+    if [ $# -gt 1 ] ; then
+        echo "extraneous arguments supplied: <${@}>"
+        usage_mark
+        exit 2
+    fi
+    filepath="$1"
+    # fail if file is not in /etc
+    echo "${filepath}" | grep -q '^/etc/'
+    if [ "$?" != "0" ] ; then
+        echo "<${filepath}> is not in /etc"
+        exit 1
+    fi
+    # check if file exist
+    if [ ! -f "${filepath}" ] ; then
+        echo "<${filepath}> does not exist"
+        exit 1
+    fi
+    set -e
+    relative_path=$(echo "${filepath}" | sed 's/^\/etc\///')
+    trap "set +e ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    setup_dir
+    # add file to list if not already present
+    line_in_file=$(grep -x -F "${relative_path}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}" 2>/dev/null || true)
+    if [ -n "${line_in_file}" ] ; then
+        echo "file already marked for encryption"
+    else
+        echo "adding <${relative_path}> to the list of encrypted files"
+        echo "${relative_path}" >> "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    fi
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function unmark() {
+    # argument parsing
+    if [ $# -lt 1 ] ; then
+        echo "missing filename"
+        usage_unmark
+        exit 2
+    fi
+    if [ $# -gt 1 ] ; then
+        echo "extraneous arguments supplied: <${@}>"
+        usage_unmark
+        exit 2
+    fi
+    filepath="$1"
+    set -e
+    relative_path=$(echo "${filepath}" | sed 's/^\/etc\///')
+    trap "set +e ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    setup_dir
+    # remove file from list if necessary
+    line_in_file=$(grep -n -x -F "${relative_path}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}" 2>/dev/null || true)
+    if [ -z "${line_in_file}" ] ; then
+        echo "file is not marked for encryption"
+    else
+        echo "removing <${relative_path}> from the list of encrypted files"
+        for line_number in $(echo "${line_in_file}" | cut -d ':' -f 1) ; do
+            sed -i "" "${line_number}d" "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+        done
+    fi
+    # delete hash file for the no-longer encrypted file
+    rm -f "${GIT_SLICE}/hashes/${relative_path}.sha256"
+    umount "${GIT_SLICE}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function list-marks() {
+    # argument parsing
+    if [ $# -ne 0 ] ; then
+        echo "extraneous arguments supplied: <${@}>"
+        usage_list_marks
+        exit 2
+    fi
+    set -e
+    trap "set +e ; umount ${GIT_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    setup_dir
+    # display encrypted file list
+    cat "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function push() {
+    # argument parsing
+    args=$(getopt f $@)
+    if [ $? -ne 0 ] ; then
+        usage_push
+        exit 2
+    fi
+    set -- $args
+    no_validation="0"
+    for i ; do
+        case "$i" in
+            -f)
+                no_validation="1"
+                shift
+                ;;
+            --)
+                shift
+                break
+        esac
+    done
+    if [ $# -ne 0 ] ; then
+        echo "extraneous arguments supplied: <${@}>"
+        usage_push
+        exit 2
+    fi
+    set -e
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; umount ${CFG_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    mount "${CFG_SLICE}"
+    # git reset
+    cd "${GIT_SLICE}/git"
+    # clean git from potential uncommited files and directories before any further action
+    echo "... cleaning local git"
+    git clean -fd
+    git reset --hard
+    echo ""
+    # encrypt files
+    echo "... encrypting files"
+    setup_dir
+    if [ ! -r "${GIT_SLICE}/${PASS_FILE}" ] ; then
+        echo "fail to access encryption key <${GIT_SLICE}/${PASS_FILE}>"
+        exit 1
+    fi
+    while read relative_path ; do
+        if [ ! -r "${CFG_SLICE}/${relative_path}" ] ; then
+            # file to encrypt does not exist anymore
+            echo "file <${CFG_SLICE}/${relative_path}> is missing. removing from git and encrypted file list..."
+            rm -f "${GIT_SLICE}/git/cfg/${relative_path}" "${GIT_SLICE}/hashes/${relative_path}.sha256" || true
+            grep -v -F -x "${relative_path}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}" | tee "${GIT_SLICE}/${ENCRYPTED_FILELIST}" &>/dev/null
+            continue
+        fi
+        relative_dir=$(dirname "${relative_path}")
+        # create hash directory structure
+        if [ -n "${relative_dir}" ] ; then
+            mkdir -p "${GIT_SLICE}/hashes/${relative_dir}"
+        fi
+        # create hash for the encrypted file
+        sha256 -q "${CFG_SLICE}/${relative_path}" > "${GIT_SLICE}/hashes/${relative_path}.sha256"
+        # create hash directory structure in git
+        if [ -n "${relative_dir}" ] ; then
+            mkdir -p "${GIT_SLICE}/git/cfg/${relative_dir}"
+        fi
+        if [ ! -r "${GIT_SLICE}/git/hashes/${relative_path}.sha256" ] ; then
+            # hash file does not exist in git. It is most likely the first time that this file is encrypted.
+            echo "encrypting <${CFG_SLICE}/${relative_path}>. first encryption."
+            openssl enc -aes256 -in "${CFG_SLICE}/${relative_path}" -out "${GIT_SLICE}/git/cfg/${relative_path}" -pass "file:${GIT_SLICE}/${PASS_FILE}" -a
+        elif [ "$(cat ${GIT_SLICE}/git/hashes/${relative_path}.sha256)" != "$(cat ${GIT_SLICE}/hashes/${relative_path}.sha256)" ] ; then
+            # hash file exist in git and is different from actual hash file. The file has been modified since last commit.
+            echo "encrypting <${CFG_SLICE}/${relative_path}>. updated."
+            openssl enc -aes256 -in "${CFG_SLICE}/${relative_path}" -out "${GIT_SLICE}/git/cfg/${relative_path}" -pass "file:${GIT_SLICE}/${PASS_FILE}" -a
+        else
+            echo "nothing to do for <${CFG_SLICE}/${relative_path}>"
+        fi
+    done < "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    echo ""
+    echo "... synchronizing encrypted file list"
+    cp -v "${GIT_SLICE}/${ENCRYPTED_FILELIST}" "${GIT_SLICE}/git/${ENCRYPTED_FILELIST}"
+    echo ""
+    echo "... synchronizing encrypted file hashes"
+    rsync -cvrh --delete "${GIT_SLICE}/hashes/" "${GIT_SLICE}/git/hashes/"
+    echo ""
+    # copy files except already encrypted files
+    echo "... synchronizing ${CFG_SLICE} to ${GIT_SLICE}/git/cfg"
+    rsync -avh --delete --exclude-from "${GIT_SLICE}/${ENCRYPTED_FILELIST}" --exclude .snap "${CFG_SLICE}/" "${GIT_SLICE}/git/cfg/"
+    # save files permissions
+    echo ""
+    echo "... saving file permissions"
+    > "${GIT_SLICE}/${PERMISSION_LIST}"
+    while read file_path ; do
+        file_ownership=$(stat -f %u:%g "${file_path}")
+        file_permissions=$(stat -f %Op "${file_path}" | tail -c 5)
+        echo "${file_path};${file_ownership};${file_permissions}" >> "${GIT_SLICE}/${PERMISSION_LIST}"
+    done <<< $(find "${CFG_SLICE}")
+    cp "${GIT_SLICE}/${PERMISSION_LIST}" "${GIT_SLICE}/git/${PERMISSION_LIST}"
+    echo ""
+    # commit and push files
+    echo "... commiting and pushing to remote"
+    git add .
+    git status
+    echo
+    git diff --cached
+    while true; do
+        if [ "${no_validation}" == "1" ] ; then
+            break
+        fi
+        read -p "Push (y/n)? " key
+        case "${key}" in
+            [yY])
+                break
+                ;;
+            [nN])
+                echo "... aborting"
+                git clean -fd
+                git reset --hard
+                exit 1
+                ;;
+            *)
+                echo "invalid input <${key}> != [yYnN]."
+                ;;
+        esac
+    done
+    echo ""
+    echo " commiting..."
+    if [ -z "${SSH_CLIENT}" ] ; then
+        commit_msg="commit_cfg from local console"
+    else
+        commit_msg="commit_cfg from $(echo ${SSH_CLIENT} | cut -d ' ' -f 1)"
+    fi
+    changes=$(git status --porcelain)
+    if [ -n "${changes}" ] ; then
+        git commit -m "${commit_msg}"
+    fi
+    echo ""
+    set +e
+    # pushing to each remote
+    while read remote ; do
+        echo " pushing to ${remote}"
+        git push -u "${remote}" master
+        echo ""
+    done <<< $(git remote)
+    set -e
+    cd "${local_dir}"
+    umount "${CFG_SLICE}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+}
+
+function pull() {
+    # argument parsing
+    args=$(getopt fe $@)
+    if [ $? -ne 0 ] ; then
+        usage_pull
+        exit 2
+    fi
+    set -- $args
+    error_if_no_modif="0"
+    no_validation="0"
+    for i ; do
+        case "$i" in
+            -e)
+                error_if_no_modif="1"
+                shift
+                ;;
+            -f)
+                no_validation="1"
+                shift
+                ;;
+            --)
+                shift
+                break
+        esac
+    done
+    if [ $# -ne 0 ] ; then
+        echo "extraneous arguments supplied: <${@}>"
+        usage_pull
+        exit 2
+    fi
+    set -e
+    modifications="0"
+    local_dir=$(pwd)
+    trap "set +e ; cd \"${local_dir}\" ; umount ${GIT_SLICE} ; umount ${CFG_SLICE} ; exit 1" 1 2 15 EXIT
+    mount "${GIT_SLICE}"
+    mount "${CFG_SLICE}"
+    setup_dir
+    # clean git from potential uncommited files and directories before any further action
+    cd "${GIT_SLICE}/git"
+    echo "... cleaning local git"
+    git clean -fd
+    git reset --hard
+    echo ""
+    # pull from remotes
+    echo "... fetching from remotes"
+    set +e
+    fetch_ok="0"
+    while read remote ; do
+        echo " pulling from ${remote}"
+        git log &>/dev/null
+        if [ "$?" == "128" ] ; then
+            empty_local="1"
+        else
+            empty_local="0"
+        fi
+        git fetch "${remote}"
+        if [ "$?" == "0" ] ; then
+            fetch_ok="1"
+            if [ "${empty_local}" == "1" ] ; then
+                # special case for empty git repository that fails on git diff
+                echo "no local commits. Fetching everything from remote."
+            else
+                diff_from_remote=$(git diff master ${remote}/master)
+                if [ -n "${diff_from_remote}" ] ; then
+                    echo "Diff from ${remote}:"
+                    echo "${diff_from_remote}"
+                else
+                    echo "Diff from ${remote}: none"
+                    echo
+                    continue
+                fi
+            fi
+            while true; do
+                if [ "${no_validation}" == "1" ] ; then
+                    git pull "${remote}" master
+                    break
+                fi
+                read -p "Pull (y/n)? " key
+                case "${key}" in
+                    [yY])
+                        git pull "${remote}" master
+                        break
+                        ;;
+                    [nN])
+                        echo "... aborting"
+                        break
+                        ;;
+                    *)
+                        echo "invalid input <${key}> != [yYnN]."
+                        ;;
+                esac
+            done
+        fi
+        echo ""
+    done <<< $(git remote)
+    # if not a single fetch succeeds, stop with error
+    if [ -n "$(git remote)" -a "${fetch_ok}" != "1" ] ; then
+        echo "fail to fetch from all remotes"
+        exit 1
+    fi
+    set -e
+    # copy files except encrypted ones
+    echo "... synchronizing ${GIT_SLICE} to ${CFG_SLICE}"
+    rsync_changes=$(rsync --delete -aimEc --exclude-from "${GIT_SLICE}/${ENCRYPTED_FILELIST}" "${GIT_SLICE}/git/cfg/" "${CFG_SLICE}/")
+    # ignore 'cannot delete non-empty directory' due to encrypted file exclusion from rsync
+    rsync_changes=$(echo "${rsync_changes}" | grep -v '^cannot delete non-empty directory:' || true)
+    if [ -n "${rsync_changes}" ] ; then
+        echo "${rsync_changes}"
+        modifications="1"
+    else
+        echo "no changes"
+    fi
+    echo ""
+    # decrypt files
+    echo "... synchronizing encrypted file list"
+    if [ ! -r "${GIT_SLICE}/${PASS_FILE}" ] ; then
+        echo "fail to access encryption key <${GIT_SLICE}/${PASS_FILE}>"
+        exit 1
+    fi
+    if [ -r "${GIT_SLICE}/git/${ENCRYPTED_FILELIST}" ] ; then
+        cp -v "${GIT_SLICE}/git/${ENCRYPTED_FILELIST}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    fi
+    echo ""
+    echo "... decrypting files"
+    while read relative_path ; do
+        if [ ! -r "${GIT_SLICE}/git/cfg/${relative_path}" ] ; then
+            echo "missing file <${GIT_SLICE}/git/cfg/${relative_path}>. skipping decryption process for this file..."
+            continue
+        fi
+        # dir is already present thanks to previous rsync
+        relative_dir=$(dirname "${relative_path}")
+        if [ ! -r "${GIT_SLICE}/hashes/${relative_path}.sha256" ] ; then
+            # no local hash for this file.
+            echo "decrypting <${CFG_SLICE}/${relative_path}>. file creation."
+            openssl enc -aes256 -in "${GIT_SLICE}/git/cfg/${relative_path}" -out "${CFG_SLICE}/${relative_path}" -pass "file:${GIT_SLICE}/${PASS_FILE}" -a -d
+            modifications="1"
+            if [ -n "${relative_dir}" ] ; then
+                mkdir -p "${GIT_SLICE}/hashes/${relative_dir}"
+            fi
+        elif [ ! -r "${GIT_SLICE}/git/hashes/${relative_path}.sha256" ] ; then
+            # git hash is missing. This case should never happens...
+            echo "decrypting <${CFG_SLICE}/${relative_path}>. missing checksum file <${GIT_SLICE}/git/hashes/${relative_path}.sha256"
+            openssl enc -aes256 -in "${GIT_SLICE}/git/cfg/${relative_path}" -out "${CFG_SLICE}/${relative_path}" -pass "file:${GIT_SLICE}/${PASS_FILE}" -a -d
+            modifications="1"
+        elif [ "$(cat ${GIT_SLICE}/git/hashes/${relative_path}.sha256)" != "$(cat ${GIT_SLICE}/hashes/${relative_path}.sha256)" ] ; then
+            # local hash is different from git hash
+            echo "decrypting <${CFG_SLICE}/${relative_path}>. updated."
+            openssl enc -aes256 -in "${GIT_SLICE}/git/cfg/${relative_path}" -out "${CFG_SLICE}/${relative_path}" -pass "file:${GIT_SLICE}/${PASS_FILE}" -a -d
+            modifications="1"
+        else
+            echo "nothing to do for <${CFG_SLICE}/${relative_path}>."
+        fi
+    done < "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    echo ""
+    echo "... restoring permissions"
+    cp "${GIT_SLICE}/git/${PERMISSION_LIST}" "${GIT_SLICE}/${PERMISSION_LIST}"
+    while read line ; do
+        file_path=$(echo "${line}" | cut -d ';' -f 1)
+        file_ownership=$(echo "${line}" | cut -d ';' -f 2)
+        file_permissions=$(echo "${line}" | cut -d ';' -f 3)
+        chown "${file_ownership}" "${file_path}"
+        chmod "${file_permissions}" "${file_path}"
+        
+    done < "${GIT_SLICE}/${PERMISSION_LIST}"
+    echo ""
+    echo "... synchronizing encrypted file hashes"
+    rsync -cvrh --delete "${GIT_SLICE}/git/hashes/" "${GIT_SLICE}/hashes/"
+    cd "${local_dir}"
+    umount "${CFG_SLICE}"
+    umount "${GIT_SLICE}"
+    set +e
+    trap 1 2 15 EXIT
+    if [ "${modifications}" != "1" -a "${error_if_no_modif}" == "1" ] ; then
+        exit 3
+    fi
+}
+
+# main action parsing
+case "$1" in
+    init)
+        init ${@:2}
+        ;;
+    add-remote)
+        add-remote ${@:2}
+        ;;
+    del-remote)
+        del-remote ${@:2}
+        ;;
+    list-remotes)
+        list-remotes ${@:2}
+        ;;
+    mark)
+        mark ${@:2}
+        ;;
+    unmark)
+        unmark ${@:2}
+        ;;
+    list-marks)
+        list-marks ${@:2}
+        ;;
+    push)
+        push ${@:2}
+        ;;
+    pull)
+        pull ${@:2}
+        ;;
+    *)
+        echo "Unsupported option..."
+        usage
+        rm -f "${lock}"
+        exit 2
+        ;;
+esac
+
+rm -f "${lock}"

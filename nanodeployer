@@ -1,0 +1,145 @@
+#!/bin/sh
+
+# PROVIDE: nanodeployer
+# REQUIRE: DAEMON NETWORKING LOGIN
+# KEYWORD: nostart
+
+. /etc/rc.subr
+
+name="nanodeployer"
+desc="Fetch configuration and new nanobsd image at boot time"
+
+rcvar="nanodeployer_enable"
+
+: ${nanodeployer_enable="NO"}
+: ${nanodeployer_remotes=""}
+: ${nanodeployer_git_email="root@$(hostname -f)"}
+: ${nanodeployer_git_username="root@$(hostname -f)"}
+: ${nanodeployer_reboot_on_changes="NO"}
+: ${nanodeployer_image_urls=""}
+: ${nanodeployer_decryption_key_file="/etc/nanodeployer_decryption.key"}
+
+start_cmd="${name}_start"
+stop_cmd=":"
+
+PATH=${PATH}:/usr/local/bin:/usr/local/sbin
+
+update_config() {
+    # initialize commit_cfg
+    bash /root/commit_cfg init -k "${nanodeployer_decryption_key_file}" -u "${nanodeployer_git_username}" -m "${nanodeployer_git_email}"
+    if [ "$?" != "0" ] ; then
+        echo "fail to initialize update config process"
+        return
+    fi
+    # add missing git remote
+    existing_remotes=$(bash /root/commit_cfg list-remotes | sed -e 's/\([^[[:space:]]]*\)[[:space:]].*/\1/' | sort -u)
+    if [ "$?" != "0" ] ; then
+        echo "fail to list existing remotes"
+        return
+    fi
+    for remote in ${nanodeployer_remotes} ; do
+        remote_name=$(echo "${remote}" | sed 's/\([^\(::\)]*\)::\(.*\)/\1/')
+        remote_url=$(echo "${remote}" | sed 's/\([^\(::\)]*\)::\(.*\)/\2/')
+        if [ -z "${remote_name}" ] ; then
+            echo "skipping invalid empty remote name <${remote_name}>"
+            continue
+        fi
+        if [ -z "${remote_url}" ] ; then
+            echo "skipping invalid empty remote url <${remote_name}>"
+            continue
+        fi
+        echo "${existing_remotes}" | grep -qFx "${remote_name}"
+        if [ "$?" == "0" ] ; then
+            echo "remote <${remote_name}> already added"
+            continue
+        fi
+        bash /root/commit_cfg add-remote -n "${remote_name}" -u "${remote_url}"
+        if [ "$?" != "0" ] ; then
+            echo "fail to add remote <${remote_name}> with url <${remote_url}>"
+            continue
+        fi
+    done
+    # retrieve remote config and reboot if needed
+    bash /root/commit_cfg pull -f -e
+    retcode="$?"
+    if [ "${retcode}" == "3" ] ; then
+        echo "configuration is up to date..."
+        return
+    fi
+    if [ "${retcode}" != "0" ] ; then
+        echo "error while getting config changes"
+        return
+    fi
+    if [ "${nanodeployer_reboot_on_changes}" == "YES" ] ; then
+        echo "rebooting to apply changes..."
+        sleep 3
+        shutdown -r now
+        exit
+    fi
+    echo "changes fetched but not applied until next reboot"
+}
+
+update_image() {
+    # get local version and compute timestamp
+    local_version=$(cat /nanobsd.version)
+    if [ "$?" != "0" ] ; then
+        echo "fail to retrieve local version"
+        return
+    fi
+    local_version_ts=$(date -jf "%a %b %d %T %Y" "${local_version}" +%s)
+    if [ "$?" != "0" ] ; then
+        echo "fail to convert local version <${local_version}> to timestamp"
+        return
+    fi
+    echo "local version: ${local_version} - ${local_version_ts}"
+    # get remote version and update NanoBSD image if needed
+    for url in ${nanodeployer_image_urls} ; do
+        remote_version=$(curl --capath /etc/ssl/certs/ --silent --fail "${url}/version")
+        if [ "$?" != "0" ] ; then
+            echo "fail to retrieve version for remote <${url}>"
+            continue
+        fi
+        remote_version_ts=$(date -jf "%a %b %d %T %Y" "${remote_version}" +%s)
+        if [ "$?" != "0" ] ; then
+            echo "fail to convert remote version <${remote_version}> to timestamp"
+            continue
+        fi
+        echo "remote version: ${remote_version} - ${remote_version_ts}"
+        if [ ${local_version_ts} -ge ${remote_version_ts} ] ; then
+            echo "already up to date for remote <${url}>"
+            continue
+        fi
+        curl --capath /etc/ssl/certs/ --output /dev/null --silent --head --fail "${url}/image.gz"
+        if [ "$?" != "0" ] ; then
+            echo "fail to reach remote image <${url}/image.gz>"
+            continue
+        fi
+        echo "updating image using <${url}/image.gz>... please wait (~15mn) and DO NOT REBOOT !"
+        if [ -t 1 ] ; then
+            curl_progress_opt="--progress-bar"
+        else
+            curl_progress_opt="--silent"
+        fi
+        curl --no-buffer --fail --capath /etc/ssl/certs/ "${curl_progress_opt}" "${url}/image.gz" | gunzip | bash /root/update
+        retcode="$?"
+        if [ "${retcode}" == "0" -a "${nanodeployer_reboot_on_changes}" == "YES" ] ; then
+            echo "image update sucessful. Rebooting..."
+            sleep 3
+            shutdown -r now
+            exit
+        elif [ "${retcode}" == "0" ] ; then
+            echo "image sucessfully updated"
+        else
+            echo "fail to update image from remote <${url}>"
+        fi
+    done
+}
+
+nanodeployer_start()
+{
+    update_config
+    update_image
+}
+
+load_rc_config "${name}"
+run_rc_command "$1"
