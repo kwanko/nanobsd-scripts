@@ -509,11 +509,11 @@ function push() {
     echo ""
     set +e
     # pushing to each remote
-    while read remote ; do
+    for remote in $(git remote); do
         echo " pushing to ${remote}"
         git push -u "${remote}" master
         echo ""
-    done <<< $(git remote)
+    done
     set -e
     cd "${local_dir}"
     umount "${CFG_SLICE}"
@@ -568,8 +568,8 @@ function pull() {
     # pull from remotes
     echo "... fetching from remotes"
     set +e
-    fetch_ok="0"
-    while read remote ; do
+    pull_ok="0"
+    for remote in $(git remote); do
         echo " pulling from ${remote}"
         git log &>/dev/null
         if [ "$?" == "128" ] ; then
@@ -579,7 +579,6 @@ function pull() {
         fi
         git fetch "${remote}"
         if [ "$?" == "0" ] ; then
-            fetch_ok="1"
             if [ "${empty_local}" == "1" ] ; then
                 # special case for empty git repository that fails on git diff
                 echo "no local commits. Fetching everything from remote."
@@ -597,12 +596,18 @@ function pull() {
             while true; do
                 if [ "${no_validation}" == "1" ] ; then
                     git pull "${remote}" master
+                    if [ "$?" == "0" ] ; then
+                        pull_ok="1"
+                    fi
                     break
                 fi
                 read -p "Pull (y/n)? " key
                 case "${key}" in
                     [yY])
                         git pull "${remote}" master
+                        if [ "$?" == "0" ] ; then
+                            pull_ok="1"
+                        fi
                         break
                         ;;
                     [nN])
@@ -616,10 +621,10 @@ function pull() {
             done
         fi
         echo ""
-    done <<< $(git remote)
+    done
     # if not a single fetch succeeds, stop with error
-    if [ -n "$(git remote)" -a "${fetch_ok}" != "1" ] ; then
-        echo "fail to fetch from all remotes"
+    if [ -n "$(git remote)" -a "${pull_ok}" != "1" ] ; then
+        echo "fail to pull from all remotes"
         exit 1
     fi
     set -e
