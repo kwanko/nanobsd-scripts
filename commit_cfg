@@ -425,6 +425,8 @@ function push() {
             grep -v -F -x "${relative_path}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}" | tee "${GIT_SLICE}/${ENCRYPTED_FILELIST}" &>/dev/null
             continue
         fi
+    done < "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    while read relative_path ; do
         relative_dir=$(dirname "${relative_path}")
         # create hash directory structure
         if [ -n "${relative_dir}" ] ; then
@@ -590,6 +592,7 @@ function pull() {
                 else
                     echo "Diff from ${remote}: none"
                     echo
+                    pull_ok="1"
                     continue
                 fi
             fi
@@ -622,7 +625,7 @@ function pull() {
         fi
         echo ""
     done
-    # if not a single fetch succeeds, stop with error
+    # if not a single pull succeeds, stop with error
     if [ -n "$(git remote)" -a "${pull_ok}" != "1" ] ; then
         echo "fail to pull from all remotes"
         exit 1
@@ -630,7 +633,7 @@ function pull() {
     set -e
     # copy files except encrypted ones
     echo "... synchronizing ${GIT_SLICE} to ${CFG_SLICE}"
-    rsync_changes=$(rsync --delete -aimEc --exclude-from "${GIT_SLICE}/${ENCRYPTED_FILELIST}" "${GIT_SLICE}/git/cfg/" "${CFG_SLICE}/")
+    rsync_changes=$(rsync --delete -aimEc --no-perms --no-group --no-owner --exclude-from "${GIT_SLICE}/${ENCRYPTED_FILELIST}" "${GIT_SLICE}/git/cfg/" "${CFG_SLICE}/")
     # ignore 'cannot delete non-empty directory' due to encrypted file exclusion from rsync
     rsync_changes=$(echo "${rsync_changes}" | grep -v '^cannot delete non-empty directory:' || true)
     if [ -n "${rsync_changes}" ] ; then
