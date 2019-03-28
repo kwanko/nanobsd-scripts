@@ -417,6 +417,7 @@ function push() {
         echo "fail to access encryption key <${GIT_SLICE}/${PASS_FILE}>"
         exit 1
     fi
+    encryted_filelist=$(cat "${GIT_SLICE}/${ENCRYPTED_FILELIST}")
     while read relative_path ; do
         if [ ! -r "${CFG_SLICE}/${relative_path}" ] ; then
             # file to encrypt does not exist anymore
@@ -425,7 +426,7 @@ function push() {
             grep -v -F -x "${relative_path}" "${GIT_SLICE}/${ENCRYPTED_FILELIST}" | tee "${GIT_SLICE}/${ENCRYPTED_FILELIST}" &>/dev/null
             continue
         fi
-    done < "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
+    done <<< ${encryted_filelist}
     while read relative_path ; do
         relative_dir=$(dirname "${relative_path}")
         # create hash directory structure
