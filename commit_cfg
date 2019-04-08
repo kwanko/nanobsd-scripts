@@ -76,9 +76,12 @@ function setup_dir() {
     if [ ! -f "${GIT_SLICE}/${ENCRYPTED_FILELIST}" ] ; then
         touch "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
     fi
-    # initialize an empty permission file
-    if [ ! -f "${GIT_SLICE}/${PERMISSION_LIST}" ] ; then
-        touch "${GIT_SLICE}/${PERMISSION_LIST}"
+    # initialize empty permission files
+    if [ ! -f "${GIT_SLICE}/${PERMISSION_LIST}.dirs" ] ; then
+        touch "${GIT_SLICE}/${PERMISSION_LIST}.dirs"
+    fi
+    if [ ! -f "${GIT_SLICE}/${PERMISSION_LIST}.files" ] ; then
+        touch "${GIT_SLICE}/${PERMISSION_LIST}.files"
     fi
 }
 
@@ -463,14 +466,23 @@ function push() {
     rsync -avh --delete --exclude-from "${GIT_SLICE}/${ENCRYPTED_FILELIST}" --exclude .snap "${CFG_SLICE}/" "${GIT_SLICE}/git/cfg/"
     # save files permissions
     echo ""
-    echo "... saving file permissions"
-    > "${GIT_SLICE}/${PERMISSION_LIST}"
+    echo "... saving file permissions (directories)"
+    > "${GIT_SLICE}/${PERMISSION_LIST}.dirs"
     while read file_path ; do
         file_ownership=$(stat -f %u:%g "${file_path}")
         file_permissions=$(stat -f %Op "${file_path}" | tail -c 5)
-        echo "${file_path};${file_ownership};${file_permissions}" >> "${GIT_SLICE}/${PERMISSION_LIST}"
-    done <<< $(find "${CFG_SLICE}")
-    cp "${GIT_SLICE}/${PERMISSION_LIST}" "${GIT_SLICE}/git/${PERMISSION_LIST}"
+        echo "${file_path};${file_ownership};${file_permissions}" >> "${GIT_SLICE}/${PERMISSION_LIST}.dirs"
+    done <<< $(find "${CFG_SLICE}" -type d)
+    cp "${GIT_SLICE}/${PERMISSION_LIST}.dirs" "${GIT_SLICE}/git/${PERMISSION_LIST}.dirs"
+    echo ""
+    echo "... saving file permissions (files)"
+    > "${GIT_SLICE}/${PERMISSION_LIST}.files"
+    while read file_path ; do
+        file_ownership=$(stat -f %u:%g "${file_path}")
+        file_permissions=$(stat -f %Op "${file_path}" | tail -c 5)
+        echo "${file_path};${file_ownership};${file_permissions}" >> "${GIT_SLICE}/${PERMISSION_LIST}.files"
+    done <<< $(find "${CFG_SLICE}" -type f)
+    cp "${GIT_SLICE}/${PERMISSION_LIST}.files" "${GIT_SLICE}/git/${PERMISSION_LIST}.files"
     echo ""
     # commit and push files
     echo "... commiting and pushing to remote"
@@ -685,16 +697,28 @@ function pull() {
         fi
     done < "${GIT_SLICE}/${ENCRYPTED_FILELIST}"
     echo ""
-    echo "... restoring permissions"
-    cp "${GIT_SLICE}/git/${PERMISSION_LIST}" "${GIT_SLICE}/${PERMISSION_LIST}"
+    echo "... restoring permissions (directories)"
+    cp "${GIT_SLICE}/git/${PERMISSION_LIST}.dirs" "${GIT_SLICE}/${PERMISSION_LIST}.dirs"
+    while read line ; do
+        file_path=$(echo "${line}" | cut -d ';' -f 1)
+        file_ownership=$(echo "${line}" | cut -d ';' -f 2)
+        file_permissions=$(echo "${line}" | cut -d ';' -f 3)
+        if [ ! -e "${file_path}" ] ; then
+            mkdir -p "${file_path}"
+        fi
+        chown "${file_ownership}" "${file_path}"
+        chmod "${file_permissions}" "${file_path}"
+    done < "${GIT_SLICE}/${PERMISSION_LIST}.dirs"
+    echo ""
+    echo "... restoring permissions (files)"
+    cp "${GIT_SLICE}/git/${PERMISSION_LIST}.files" "${GIT_SLICE}/${PERMISSION_LIST}.files"
     while read line ; do
         file_path=$(echo "${line}" | cut -d ';' -f 1)
         file_ownership=$(echo "${line}" | cut -d ';' -f 2)
         file_permissions=$(echo "${line}" | cut -d ';' -f 3)
         chown "${file_ownership}" "${file_path}"
         chmod "${file_permissions}" "${file_path}"
-        
-    done < "${GIT_SLICE}/${PERMISSION_LIST}"
+    done < "${GIT_SLICE}/${PERMISSION_LIST}.files"
     echo ""
     echo "... synchronizing encrypted file hashes"
     rsync -cvrh --delete "${GIT_SLICE}/git/hashes/" "${GIT_SLICE}/hashes/"
